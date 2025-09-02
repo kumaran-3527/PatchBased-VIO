@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, List, Optional
-
 
 def _norm_layer(kind : str, num_channels : int) -> nn.Module :
     """
@@ -22,75 +20,11 @@ def _norm_layer(kind : str, num_channels : int) -> nn.Module :
         return ValueError(f"Unsupported norm kind: {kind!r}")
     
 
-
 class L2Norm(nn.Module):
     def forward(self, x):  # channel-wise unit vectors
         return F.normalize(x, p=2, dim=1, eps=1e-6)
-
-
-
-class AddCoords(nn.Module):
-    
-    def __init__(self):
-        super().__init__()
-        pass
-
-    def forward(self,x):
-        b,c,h,w = x.shape
-        yy = torch.linspace(-1,1,steps = h,device=x.device).view(1,1,h,1).expand(b,1,h,w)
-        xx = torch.linspace(-1,1,steps=w,device=x.device).view(1,1,1,w).expand(b,1,h,w)
-        return torch.cat([x,xx,yy])
     
 
-
-class ResidualBlock(nn.Module):
-    """
-    Standard 2×(3×3) residual block.
-    Supports optional downsampling via stride=2 on the first conv.
-    Uses ReLU nonlinearity and a configurable normalization kind.
-    """
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        stride: int = 1,
-        norm_kind: str = "none",
-    ):
-        super().__init__()
-        # If no normalization, keep bias=True; otherwise bias=False is customary.
-        use_bias = (norm_kind == "none")
-
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3,
-                               stride=stride, padding=1, bias=use_bias)
-        self.norm1 = _norm_layer(norm_kind, out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3,
-                               stride=1, padding=1, bias=use_bias)
-        self.norm2 = _norm_layer(norm_kind, out_channels)
-
-        # Projection for residual if shape changes
-        if stride != 1 or in_channels != out_channels:
-            self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1,
-                                  stride=stride, bias=True)
-        else:
-            self.proj = nn.Identity()
-
-        if hasattr(self.norm2, 'weight'):
-            nn.init.zeros_(self.norm2.weight)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = self.proj(x)
-
-        out = self.conv1(x)
-        out = self.norm1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.norm2(out)
-
-        out = out + identity
-        out = self.relu(out)
-        return out
 
 class PreActResidualBlock(nn.Module) : 
     """
@@ -99,7 +33,7 @@ class PreActResidualBlock(nn.Module) :
     """
     def __init__(self, in_channels, out_channels, kernel_size = 3,stride = 1, norm_kind = 'none' , dilation : int = 1) :
 
-        super.__init__()
+        super().__init__()
         use_bias = (norm_kind == 'none')
         self.norm1 = _norm_layer(norm_kind, in_channels)
         self.norm2 = _norm_layer(norm_kind,out_channels)
@@ -128,6 +62,20 @@ class PreActResidualBlock(nn.Module) :
         res = out + skip
 
         return res
+
+
+class AddCoords(nn.Module):
+    
+    def __init__(self):
+        super().__init__()
+        pass
+
+    def forward(self,x):
+        
+        b,c,h,w = x.shape
+        yy = torch.linspace(-1,1,steps = h,device=x.device).view(1,1,h,1).expand(b,1,h,w)
+        xx = torch.linspace(-1,1,steps=w,device=x.device).view(1,1,1,w).expand(b,1,h,w)
+        return torch.cat([x,xx,yy],dim=1)  # (B, c+2, H, W)
     
 
 
@@ -139,27 +87,34 @@ class _BaseEncoder(nn.Module):
       - Stage 2: 2 residual blocks at 1/4 res (C=64), with downsample on the first block
     Norm kind differs between Matching (instance) and Context (none).
     """
-    def __init__(self, norm_kind: str):
+    def __init__(self, norm_kind: str, add_coords : bool = False):
         super().__init__()
         use_bias = (norm_kind == "none")
 
+        if add_coords:
+            in_channels = 5
+            self.add_coords = AddCoords()
+        else:
+            in_channels = 3
+            self.add_coords = nn.Identity()
+            
         # Stem: 7x7 conv stride 2 → output channels 32
         self.stem = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=7, stride=2, padding=3, bias=use_bias),
+            nn.Conv2d(in_channels, 32, kernel_size=7, stride=2, padding=3, bias=use_bias),
             _norm_layer(norm_kind, 32),
             nn.ReLU(inplace=True),
         )
 
         # Stage 1 @ 1/2 resolution: two residual blocks, C=32
         self.layer1 = nn.Sequential(
-            ResidualBlock(32, 32, stride=1, norm_kind=norm_kind),
-            ResidualBlock(32, 32, stride=1, norm_kind=norm_kind),
+            PreActResidualBlock(32, 32, stride=1, norm_kind=norm_kind),
+            PreActResidualBlock(32, 32, stride=1, norm_kind=norm_kind),
         )
 
         # Stage 2 @ 1/4 resolution: downsample then another block, C=64
         self.layer2 = nn.Sequential(
-            ResidualBlock(32, 64, stride=2, norm_kind=norm_kind),  # downsample to 1/4
-            ResidualBlock(64, 64, stride=1, norm_kind=norm_kind),
+            PreActResidualBlock(32, 64, stride=2, norm_kind=norm_kind),  # downsample to 1/4
+            PreActResidualBlock(64, 64, stride=1, norm_kind=norm_kind),
         )
 
         # Kaiming init for convs
@@ -182,40 +137,45 @@ class _BaseEncoder(nn.Module):
         Input:  (N, 3, H, W)
         Output: (N, 64, H/4, W/4)
         """
+        x = self.add_coords(x)
         x = self.stem(x)     # -> (N, 32, H/2, W/2)
         x = self.layer1(x)   # -> (N, 32, H/2, W/2)
         x = self.layer2(x)   # -> (N, 64, H/4, W/4)
         return x
 
 
-class MatchingEncoder(_BaseEncoder):
-    """
-    Matching feature network (uses InstanceNorm).
-    """
+class ContextEncoder(nn.Module) :
+    
     def __init__(self):
-        super().__init__(norm_kind="instance")
+        super().__init__()
+        self.backbone = _BaseEncoder(norm_kind="none", add_coords=False)
+
+    def forward(self, x):
+        return self.backbone(x)
+
+
+
+class MatchingEncoder(nn.Module) :
+
+    def __init__(self, add_coords: bool = True):
+        super().__init__()
+
+        self.backbone = _BaseEncoder(norm_kind="instance", add_coords = add_coords)
+        self.l2 = L2Norm()
 
     @staticmethod
-    def build_two_level_pyramid(feat_1_4: torch.Tensor) -> List[torch.Tensor]:
-        """
-        Two-level feature pyramid from matching features:
-          - Level 0: original 1/4 res (C=64)
-          - Level 1: average-pooled with 4×4 kernel & stride 4 → ~1/16 res
-        """
+    def build_two_level_pyramid(feat_1_4: torch.Tensor):
         lvl0 = feat_1_4
-        lvl1 = F.avg_pool2d(feat_1_4, kernel_size=4, stride=4, padding=0)
+        lvl1 = F.avg_pool2d(feat_1_4, kernel_size=4, stride=4)  # ~1/16
         return [lvl0, lvl1]
 
+    def forward(self, x):
 
-class ContextEncoder(_BaseEncoder):
-    """
-    Context feature network (no normalization).
-    """
-    def __init__(self):
-        super().__init__(norm_kind="none")
+        f = self.backbone(x)
+        f = self.l2(f)  # normalize features for matching
+        return f
 
-
-
+    
 if __name__ == "__main__":
     enc_match = MatchingEncoder()
     enc_ctx = ContextEncoder()
@@ -229,3 +189,7 @@ if __name__ == "__main__":
 
     f_ctx_1_4 = enc_ctx(x)           # (2, 64, 64, 64)
     print(f_match_1_4.shape, pyramid[1].shape, f_ctx_1_4.shape)
+
+
+
+
