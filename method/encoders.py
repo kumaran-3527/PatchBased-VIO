@@ -113,8 +113,8 @@ class PreActResidualBlock(nn.Module) :
         self.need_proj = (stride != 1) or (in_channels != out_channels) 
         self.proj = nn.Conv2d(in_channels, out_channels, 1, stride = stride, bias = True) if self.need_proj else nn.Identity()
 
-        if hasattr(self.norm2, 'weight'):
-            nn.init.zeros_(self.norm2.weight)
+        # if hasattr(self.norm2, 'weight'):
+        #     nn.init.zeros_(self.norm2.weight)
 
     def forward(self,x) : 
 
